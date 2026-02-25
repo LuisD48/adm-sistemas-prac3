@@ -2,8 +2,11 @@
 # =============================================================
 #  Script de Configuración Automática de DNS - BIND9
 #  Sistema Operativo: OpenSUSE (Leap / Tumbleweed)
-#  Dominio: reprobados.com
-#  Versión: 1.2
+#  Versión: 1.3
+#
+#  USO:
+#    sudo bash dns_linux_opensuse.sh
+#    El dominio se configura en la Opción 3 del menú
 # =============================================================
 
 # ── Colores ──────────────────────────────────────────────────
@@ -14,10 +17,11 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-DOMAIN="reprobados.com"
-ZONE_FILE="/var/lib/named/${DOMAIN}.zone"
+# ── Variables globales (dominio se configura en opción 3) ─────
+DOMAIN=""
+ZONE_FILE=""
 NAMED_CONF="/etc/named.conf"
-NAMED_CONF_LOCAL="/etc/named.d/${DOMAIN}.conf"
+NAMED_CONF_LOCAL=""
 DNS_IP=""
 
 # ── Funciones de log ─────────────────────────────────────────
@@ -34,6 +38,17 @@ check_root() {
     fi
 }
 
+# ── Banner ────────────────────────────────────────────────────
+print_banner() {
+    clear
+    local DOM_DISPLAY="${DOMAIN:-Sin configurar}"
+    echo -e "${CYAN}${BOLD}"
+    echo "╔══════════════════════════════════════════════╗"
+    echo "║   Administrador DNS - BIND9 - OpenSUSE       ║"
+    printf "║   Dominio: %-34s║\n" "${DOM_DISPLAY}"
+    echo "╚══════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
 
 # ── Función auxiliar: configurar IP estática (wicked) ────────
 _configurar_ip_estatica() {
@@ -131,6 +146,29 @@ _asegurar_include_named() {
     else
         log_info "Include de zona ya presente en named.conf."
     fi
+}
+
+# ── Función auxiliar: pedir y validar dominio ────────────────
+_resolver_dominio() {
+    if [[ -n "$DOMAIN" ]]; then return 0; fi
+
+    echo -ne "\nIngresa el dominio a configurar (ej: reprobados.com): "
+    read -r DOMAIN
+    if [[ -z "$DOMAIN" ]]; then
+        DOMAIN="reprobados.com"
+        log_warn "No se ingresó dominio. Usando valor por defecto: ${DOMAIN}"
+    fi
+
+    if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$ ]]; then
+        log_error "Formato de dominio inválido: ${DOMAIN}"
+        DOMAIN=""
+        return 1
+    fi
+
+    ZONE_FILE="/var/lib/named/${DOMAIN}.zone"
+    NAMED_CONF_LOCAL="/etc/named.d/${DOMAIN}.conf"
+    log_ok "Dominio configurado: ${DOMAIN}"
+    return 0
 }
 
 # ════════════════════════════════════════════════════════════
@@ -242,11 +280,37 @@ EOF
     systemctl restart named && log_ok "Servicio named reiniciado." || log_error "Error al reiniciar named."
 }
 
+# ── Función auxiliar: solicitar/validar dominio ──────────────
+_configurar_dominio() {
+    if [[ -n "$DOMAIN" ]]; then
+        log_info "Dominio activo: ${DOMAIN}"
+        echo -ne "¿Deseas usar otro dominio? (s/n): "; read -r CAMBIAR
+        if [[ ! "$CAMBIAR" =~ ^[Ss]$ ]]; then return; fi
+    fi
+
+    echo -ne "Ingresa el dominio a configurar (ej: reprobados.com): "; read -r INPUT_DOMAIN
+    if [[ -z "$INPUT_DOMAIN" ]]; then
+        INPUT_DOMAIN="reprobados.com"
+        log_warn "No se ingresó dominio. Usando valor por defecto: ${INPUT_DOMAIN}"
+    fi
+
+    if ! [[ "$INPUT_DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$ ]]; then
+        log_error "Formato de dominio inválido: ${INPUT_DOMAIN}"; return 1
+    fi
+
+    DOMAIN="$INPUT_DOMAIN"
+    ZONE_FILE="/var/lib/named/${DOMAIN}.zone"
+    NAMED_CONF_LOCAL="/etc/named.d/${DOMAIN}.conf"
+    log_ok "Dominio configurado: ${DOMAIN}"
+}
+
 # ════════════════════════════════════════════════════════════
 #  OPCIÓN 3 — Configuración de Dominio DNS (Registros)
 # ════════════════════════════════════════════════════════════
 opcion_dominio() {
     echo -e "\n${BOLD}── [ 3 ] Configuración de Dominio DNS ─────────────${NC}"
+
+    _configurar_dominio || return
 
     if [[ ! -f "$ZONE_FILE" ]]; then
         log_error "Archivo de zona no encontrado: ${ZONE_FILE}"
@@ -390,12 +454,7 @@ opcion_consultar() {
 # ════════════════════════════════════════════════════════════
 menu_principal() {
     while true; do
-            clear
-		echo -e "${CYAN}${BOLD}"
-		echo ""
-		echo "   Administrador DNS OpenSUSE	    "
-		echo ""
-		echo -e "${NC}"
+        print_banner
         echo -e "  ${BOLD}1)${NC} Instalación Idempotente"
         echo -e "  ${BOLD}2)${NC} Configuración de Zona DNS"
         echo -e "  ${BOLD}3)${NC} Configuración de Dominio DNS"
