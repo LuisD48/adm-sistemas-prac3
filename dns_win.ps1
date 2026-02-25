@@ -1,11 +1,16 @@
-<#
-.SYNOPSIS
-    Gestor DNS
-.DESCRIPTION
-    Administrador DNS de Windows Server
-#>
+Set-Content -Path "dns_win.ps1" -Value @'
+# =============================================================
+#  Script de Configuración Automática de DNS - Windows Server
+#  Versión: 1.2
+#
+#  USO:
+#    .\dns_windows.ps1                        (pide dominio interactivamente)
+#    .\dns_windows.ps1 -Domain midominio.com  (dominio como parámetro)
+# =============================================================
 
-$DOMAIN = "reprobados.com"
+#Requires -RunAsAdministrator
+
+$DOMAIN = ""
 $DNS_IP = ""
 $ErrorActionPreference = "Continue"
 
@@ -15,6 +20,15 @@ function Log-Ok    { param($msg) Write-Host "[OK]    $msg" -ForegroundColor Gree
 function Log-Warn  { param($msg) Write-Host "[WARN]  $msg" -ForegroundColor Yellow }
 function Log-Error { param($msg) Write-Host "[ERROR] $msg" -ForegroundColor Red }
 
+function Print-Banner {
+    Clear-Host
+    $domDisplay = if ([string]::IsNullOrWhiteSpace($DOMAIN)) { "Sin configurar" } else { $DOMAIN }
+    Write-Host "╔══════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║   Administrador DNS - Windows Server         ║" -ForegroundColor Cyan
+    Write-Host ("║   Dominio: " + $domDisplay.PadRight(34) + "║") -ForegroundColor Cyan
+    Write-Host "╚══════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+}
 
 # ── Función auxiliar: configurar IP estática ─────────────────
 function _Set-StaticIP {
@@ -73,6 +87,28 @@ function _Resolve-IP {
     }
 }
 
+
+# ── Función auxiliar: pedir y validar dominio ────────────────
+function _Resolver-Dominio {
+    if (-not [string]::IsNullOrWhiteSpace($script:DOMAIN)) { return $true }
+
+    Write-Host ""
+    $d = Read-Host "Ingresa el dominio a configurar (ej: reprobados.com)"
+    if ([string]::IsNullOrWhiteSpace($d)) {
+        $d = "reprobados.com"
+        Log-Warn "No se ingresó dominio. Usando valor por defecto: $d"
+    }
+
+    if ($d -notmatch "^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$") {
+        Log-Error "Formato de dominio inválido: $d"
+        return $false
+    }
+
+    $script:DOMAIN = $d
+    Log-Ok "Dominio configurado: $($script:DOMAIN)"
+    return $true
+}
+
 # ════════════════════════════════════════════════════════════
 #  OPCIÓN 1 — Instalación Idempotente
 # ════════════════════════════════════════════════════════════
@@ -89,11 +125,38 @@ function Opcion-Instalacion {
         Log-Ok "Rol DNS ya instalado. No se reinstalará (idempotente)."
 
         $svc = Get-Service -Name "DNS" -ErrorAction SilentlyContinue
-        if ($svc -and $svc.Status -ne "Running") {
-            Start-Service DNS
-            Log-Ok "Servicio DNS iniciado."
-        } else {
+
+        if (-not $svc) {
+            Log-Error "El servicio DNS no fue encontrado en el sistema."
+            return
+        }
+
+        if ($svc.Status -eq "Running") {
             Log-Ok "Servicio DNS ya en ejecución."
+            return
+        }
+
+        Log-Info "Configurando inicio automático del servicio DNS..."
+        Set-Service DNS -StartupType Automatic
+
+        Log-Info "Intentando iniciar el servicio DNS..."
+        try {
+            Start-Service DNS -ErrorAction Stop
+            Start-Sleep -Seconds 3
+
+            $svcCheck = Get-Service -Name "DNS"
+            if ($svcCheck.Status -eq "Running") {
+                Log-Ok "Servicio DNS iniciado correctamente."
+            } else {
+                Log-Error "El servicio no quedó en estado Running. Estado actual: $($svcCheck.Status)"
+                Log-Warn "Revisa el Visor de Eventos: eventvwr.msc -> Registros de Windows -> Sistema"
+            }
+        } catch {
+            Log-Error "No se pudo iniciar el servicio DNS: $_"
+            Log-Warn "Posibles causas:"
+            Log-Warn "  1) El rol DNS requiere reiniciar el servidor tras la instalación."
+            Log-Warn "  2) Conflicto con otro servicio en el puerto 53."
+            Log-Warn "Verifica con: Get-EventLog -LogName System -Source DNS -Newest 5"
         }
         return
     }
@@ -115,6 +178,46 @@ function Opcion-Instalacion {
 function Opcion-Zona {
     Write-Host "`n── [ 2 ] Configuración de Zona DNS ────────────────" -ForegroundColor White
 
+    # ── Verificar que el servicio DNS esté activo ─────────
+    Log-Info "Verificando que el servicio DNS esté activo..."
+    $svc = Get-Service -Name "DNS" -ErrorAction SilentlyContinue
+
+    if (-not $svc) {
+        Log-Error "Servicio DNS no encontrado. Ejecuta primero la Opción 1 (Instalación)."
+        return
+    }
+
+    if ($svc.Status -ne "Running") {
+        # Verificar si el servicio está deshabilitado y reactivarlo
+        $startType = (Get-Service DNS).StartType
+        if ($startType -eq "Disabled") {
+            Log-Warn "Servicio DNS deshabilitado. Reactivando..."
+            Set-Service DNS -StartupType Automatic
+            Log-Ok "Tipo de inicio restaurado a Automático."
+        }
+
+        Log-Warn "Servicio DNS detenido. Iniciando..."
+        try {
+            Start-Service DNS -ErrorAction Stop
+            Start-Sleep -Seconds 3
+
+            $check = Get-Service -Name "DNS"
+            if ($check.Status -eq "Running") {
+                Log-Ok "Servicio DNS iniciado correctamente."
+            } else {
+                Log-Error "El servicio no quedó en estado Running. Estado: $($check.Status)"
+                Log-Warn "Intenta reiniciar el servidor con: Restart-Computer"
+                return
+            }
+        } catch {
+            Log-Error "No se pudo iniciar el servicio DNS: $_"
+            Log-Warn "Intenta reiniciar el servidor con: Restart-Computer"
+            return
+        }
+    } else {
+        Log-Ok "Servicio DNS en ejecución."
+    }
+
     _Resolve-IP
 
     Log-Info "Verificando si la zona $DOMAIN ya existe..."
@@ -133,6 +236,7 @@ function Opcion-Zona {
         Log-Ok "Zona primaria '$DOMAIN' creada correctamente."
     } catch {
         Log-Error "Error al crear zona: $_"
+        Log-Warn "Asegúrate de haber ejecutado la Opción 1 (Instalación) primero."
     }
 }
 
@@ -141,6 +245,33 @@ function Opcion-Zona {
 # ════════════════════════════════════════════════════════════
 function Opcion-Dominio {
     Write-Host "`n── [ 3 ] Configuración de Dominio DNS ─────────────" -ForegroundColor White
+
+    # ── Solicitar dominio si no está configurado ──────────
+    if ([string]::IsNullOrWhiteSpace($script:DOMAIN)) {
+        $input = Read-Host "Ingresa el dominio a configurar (ej: reprobados.com)"
+        if ([string]::IsNullOrWhiteSpace($input)) {
+            $input = "reprobados.com"
+            Log-Warn "No se ingresó dominio. Usando valor por defecto: $input"
+        }
+        if ($input -notmatch "^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$") {
+            Log-Error "Formato de dominio inválido: $input"
+            return
+        }
+        $script:DOMAIN = $input
+        Log-Ok "Dominio configurado: $($script:DOMAIN)"
+    } else {
+        Log-Info "Dominio activo: $($script:DOMAIN)"
+        $cambiar = Read-Host "¿Deseas usar otro dominio? (s/n)"
+        if ($cambiar -match "^[Ss]$") {
+            $input = Read-Host "Nuevo dominio"
+            if ($input -notmatch "^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$") {
+                Log-Error "Formato de dominio inválido: $input"
+                return
+            }
+            $script:DOMAIN = $input
+            Log-Ok "Dominio actualizado: $($script:DOMAIN)"
+        }
+    }
 
     $zona = Get-DnsServerZone -Name $DOMAIN -ErrorAction SilentlyContinue
     if (-not $zona) {
@@ -276,11 +407,8 @@ function Opcion-Consultar {
 # ════════════════════════════════════════════════════════════
 function Menu-Principal {
     while ($true) {
-		Clear-Host
-		Write-Host ""
-		Write-Host "  Administrador DNS - Windows Server         " -ForegroundColor Cyan
-		Write-Host ""
-        Write-Host "  1) Instalación Idempotente"     	-ForegroundColor White
+        Print-Banner
+        Write-Host "  1) Instalación Idempotente"      -ForegroundColor White
         Write-Host "  2) Configuración de Zona DNS"     -ForegroundColor White
         Write-Host "  3) Configuración de Dominio DNS"  -ForegroundColor White
         Write-Host "  4) Dar de Baja DNS"               -ForegroundColor White
@@ -307,3 +435,4 @@ function Menu-Principal {
 
 # ── Punto de entrada ──────────────────────────────────────────
 Menu-Principal
+'@
