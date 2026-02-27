@@ -86,17 +86,37 @@ EOF
         echo "NETCONFIG_DNS_STATIC_SERVERS='${DNS1} 8.8.8.8'" >> "$DNS_FILE"
     fi
 
-    # Aplicar configuración
-    wicked ifdown "$IFACE" &>/dev/null
-    wicked ifup "$IFACE"
-    netconfig update -f &>/dev/null
+    # Aplicar configuración — detectar gestor de red disponible
+    if command -v nmcli &>/dev/null; then
+        log_info "Aplicando configuración con NetworkManager (nmcli)..."
+        CONN_NAME=$(nmcli -t -f NAME,DEVICE con show --active | grep ":${IFACE}$" | cut -d: -f1)
+        if [[ -z "$CONN_NAME" ]]; then
+            CONN_NAME="$IFACE"
+        fi
+        nmcli con mod "$CONN_NAME" ipv4.addresses "${NEW_IP}/${PREFIX}"             ipv4.gateway "$GATEWAY"             ipv4.dns "$DNS1 8.8.8.8"             ipv4.method manual &>/dev/null
+        nmcli con down "$CONN_NAME" &>/dev/null
+        nmcli con up "$CONN_NAME" &>/dev/null
+        APPLY_OK=$?
+    elif command -v wicked &>/dev/null; then
+        log_info "Aplicando configuración con wicked..."
+        netconfig update -f &>/dev/null
+        wicked ifdown "$IFACE" &>/dev/null
+        wicked ifup "$IFACE" &>/dev/null
+        APPLY_OK=$?
+    else
+        log_warn "Aplicando con ip/ifconfig directamente..."
+        ip addr flush dev "$IFACE" 2>/dev/null
+        ip addr add "${NEW_IP}/${PREFIX}" dev "$IFACE"
+        ip route add default via "$GATEWAY" dev "$IFACE" 2>/dev/null
+        APPLY_OK=$?
+    fi
 
-    if [[ $? -eq 0 ]]; then
+    if [[ $APPLY_OK -eq 0 ]]; then
         log_ok "IP estática aplicada: ${NEW_IP}/${PREFIX}"
         DNS_IP="$NEW_IP"
     else
-        log_error "Error al aplicar configuración de red."
-        return 1
+        log_warn "Configuración escrita pero hubo un error al aplicar. Puede requerir reinicio."
+        DNS_IP="$NEW_IP"
     fi
 }
 
@@ -264,6 +284,19 @@ opcion_instalacion() {
 opcion_zona() {
     echo -e "\n${BOLD}── [ 2 ] Configuración de Zona DNS ────────────────${NC}"
 
+    # Verificar que BIND esté instalado antes de continuar
+    if ! rpm -q bind &>/dev/null; then
+        log_error "BIND no está instalado. Ejecuta primero la Opción 1 (Instalación)."
+        return
+    fi
+
+    # Verificar que named-checkconf esté disponible
+    if ! command -v named-checkconf &>/dev/null; then
+        log_warn "named-checkconf no encontrado. Instalando bind-utils..."
+        zypper --non-interactive install bind-utils &>/dev/null
+    fi
+
+    _resolver_dominio || return
     _resolver_ip
 
     # Asegurar que existe el directorio para configuraciones de zona
