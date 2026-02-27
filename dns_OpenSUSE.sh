@@ -104,25 +104,67 @@ EOF
 _resolver_ip() {
     if [[ -n "$DNS_IP" ]]; then return; fi
 
-    local DETECTED
-    DETECTED=$(hostname -I | awk '{print $1}')
-    local IFACE
-    IFACE=$(ip route get 1 2>/dev/null | awk '{print $5; exit}')
+    # Listar todas las interfaces activas con IPv4 (excluir loopback)
+    echo ""
+    log_info "Interfaces de red disponibles:"
+    local -a IFACES=()
+    local -a IPS=()
+    local idx=1
+
+    while IFS= read -r IFACE_LINE; do
+        local iface ip cfg tipo
+        iface=$(echo "$IFACE_LINE" | awk '{print $2}' | tr -d ':@')
+        [[ "$iface" == "lo" ]] && continue
+        ip=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]}' | head -1)
+        [[ -z "$ip" ]] && continue
+        cfg="/etc/sysconfig/network/ifcfg-${iface}"
+        if [[ -f "$cfg" ]] && grep -q "BOOTPROTO=.static." "$cfg" 2>/dev/null; then
+            tipo="Estática"
+        else
+            tipo="DHCP"
+        fi
+        echo -e "  ${BOLD}${idx})${NC} ${iface} | IP: ${ip} | ${tipo}"
+        IFACES+=("$iface")
+        IPS+=("$ip")
+        ((idx++))
+    done < <(ip -o link show up)
+
+    if [[ ${#IFACES[@]} -eq 0 ]]; then
+        log_error "No se encontraron interfaces de red activas."
+        return 1
+    fi
+
+    echo ""
+    echo -ne "Selecciona la interfaz de red interna [1-${#IFACES[@]}]: "; read -r SEL
+    SEL=$(( SEL - 1 ))
+
+    if [[ $SEL -lt 0 || $SEL -ge ${#IFACES[@]} ]]; then
+        log_warn "Selección inválida. Usando primera interfaz."
+        SEL=0
+    fi
+
+    local IFACE="${IFACES[$SEL]}"
+    local DETECTED="${IPS[$SEL]}"
     local CFG_FILE="/etc/sysconfig/network/ifcfg-${IFACE}"
 
-    log_info "Interfaz activa: ${IFACE} | IP detectada: ${DETECTED}"
+    log_info "Interfaz seleccionada: ${IFACE} | IP: ${DETECTED}"
 
-    # En OpenSUSE, BOOTPROTO='static' indica IP fija
     local IS_STATIC=false
-    if [[ -f "$CFG_FILE" ]] && grep -q "BOOTPROTO='static'\|BOOTPROTO=static" "$CFG_FILE" 2>/dev/null; then
+    if [[ -f "$CFG_FILE" ]] && grep -q "BOOTPROTO=.static." "$CFG_FILE" 2>/dev/null; then
         IS_STATIC=true
     fi
 
     if $IS_STATIC; then
-        log_ok "IP estática detectada: ${DETECTED}"
-        DNS_IP="$DETECTED"
+        log_ok "IP estática confirmada: ${DETECTED}"
+        echo -ne "¿Deseas modificar la IP, gateway o DNS de esta interfaz? (s/n): "; read -r CAMBIAR
+        if [[ "$CAMBIAR" =~ ^[Ss]$ ]]; then
+            _configurar_ip_estatica "$IFACE"
+        else
+            DNS_IP="$DETECTED"
+            log_ok "Usando IP estática actual: ${DNS_IP}"
+        fi
     else
-        log_warn "IP dinámica o sin configuración estática detectada."
+        log_warn "IP dinámica detectada en ${IFACE}: ${DETECTED}"
         echo -ne "¿Configurar IP estática ahora? (s/n): "; read -r REPLY
         if [[ "$REPLY" =~ ^[Ss]$ ]]; then
             _configurar_ip_estatica "$IFACE"

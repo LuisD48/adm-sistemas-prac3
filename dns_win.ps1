@@ -64,17 +64,57 @@ function _Set-StaticIP {
 function _Resolve-IP {
     if ($script:DNS_IP -ne "") { return }
 
-    $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
-    $ipCfg   = Get-NetIPConfiguration -InterfaceIndex $adapter.InterfaceIndex
-    $currentIP = $ipCfg.IPv4Address.IPAddress
+    # Obtener todos los adaptadores activos con IPv4
+    $adapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" }
 
-    $dhcp = (Get-NetIPInterface -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4).Dhcp
+    if ($adapters.Count -eq 0) {
+        Log-Error "No se encontraron adaptadores de red activos."
+        return
+    }
+
+    # Mostrar todas las interfaces disponibles para que el usuario elija
+    Write-Host ""
+    Log-Info "Interfaces de red disponibles:"
+    $i = 1
+    $adapterList = @()
+    foreach ($a in $adapters) {
+        $ipCfg = Get-NetIPConfiguration -InterfaceIndex $a.InterfaceIndex -ErrorAction SilentlyContinue
+        $ip = if ($ipCfg.IPv4Address) { $ipCfg.IPv4Address.IPAddress } else { "Sin IP" }
+        $dhcpStatus = (Get-NetIPInterface -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).Dhcp
+        $tipo = if ($dhcpStatus -eq "Disabled") { "Estática" } else { "DHCP" }
+        Write-Host "  $i) $($a.Name) | IP: $ip | $tipo" -ForegroundColor White
+        $adapterList += $a
+        $i++
+    }
+
+    Write-Host ""
+    $sel = Read-Host "Selecciona la interfaz de red interna [1-$($adapterList.Count)]"
+    $idx = [int]$sel - 1
+
+    if ($idx -lt 0 -or $idx -ge $adapterList.Count) {
+        Log-Error "Selección inválida. Usando primera interfaz."
+        $idx = 0
+    }
+
+    $adapter  = $adapterList[$idx]
+    $ipCfg    = Get-NetIPConfiguration -InterfaceIndex $adapter.InterfaceIndex
+    $currentIP = if ($ipCfg.IPv4Address) { $ipCfg.IPv4Address.IPAddress } else { "" }
+    $dhcp     = (Get-NetIPInterface -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4).Dhcp
 
     if ($dhcp -eq "Disabled") {
-        Log-Ok "IP estática detectada: $currentIP"
-        $script:DNS_IP = $currentIP
+        Log-Ok "IP estática detectada en $($adapter.Name): $currentIP"
+        Write-Host ""
+        $cambiar = Read-Host "¿Deseas modificar la IP, gateway o DNS de esta interfaz? (s/n)"
+        if ($cambiar -match "^[Ss]$") {
+            $result = _Set-StaticIP -AdapterIndex $adapter.InterfaceIndex -AdapterName $adapter.Name
+            if ($result) { $script:DNS_IP = $result }
+            else         { $script:DNS_IP = $currentIP }
+        } else {
+            $script:DNS_IP = $currentIP
+            Log-Ok "Usando IP estática actual: $currentIP"
+        }
     } else {
-        Log-Warn "IP dinámica (DHCP) detectada: $currentIP"
+        Log-Warn "IP dinámica (DHCP) en $($adapter.Name): $currentIP"
         $resp = Read-Host "¿Configurar IP estática ahora? (s/n)"
         if ($resp -match "^[Ss]$") {
             $result = _Set-StaticIP -AdapterIndex $adapter.InterfaceIndex -AdapterName $adapter.Name
@@ -177,6 +217,8 @@ function Opcion-Instalacion {
 # ════════════════════════════════════════════════════════════
 function Opcion-Zona {
     Write-Host "`n── [ 2 ] Configuración de Zona DNS ────────────────" -ForegroundColor White
+    if (-not (_Resolver-Dominio)) { return }
+
 
     # ── Verificar que el servicio DNS esté activo ─────────
     Log-Info "Verificando que el servicio DNS esté activo..."
@@ -320,6 +362,8 @@ function Opcion-Dominio {
 function Opcion-Baja {
     Write-Host "`n── [ 4 ] Dar de Baja DNS ──────────────────────────" -ForegroundColor White
 
+    if (-not (_Resolver-Dominio)) { return }
+
     $conf = Read-Host "¿Confirmas dar de baja el DNS para $DOMAIN? (s/n)"
     if ($conf -notmatch "^[Ss]$") {
         Log-Warn "Operación cancelada."; return
@@ -366,6 +410,9 @@ function Opcion-Consultar {
     Write-Host "`n── [ 5 ] Consultar DNS ────────────────────────────" -ForegroundColor White
 
     # Estado del servicio
+    if (-not (_Resolver-Dominio)) { return }
+    _Resolve-IP
+
     Write-Host ""
     Log-Info "Estado del servicio DNS:"
     $svc = Get-Service -Name "DNS" -ErrorAction SilentlyContinue
