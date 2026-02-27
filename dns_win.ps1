@@ -1,485 +1,539 @@
-Set-Content -Path "dns_win.ps1" -Value @'
+#!/bin/bash
 # =============================================================
-#  Script de Configuración Automática de DNS - Windows Server
-#  Versión: 1.2
+#  Script de Configuración Automática de DNS - BIND9
+#  Sistema Operativo: OpenSUSE (Leap / Tumbleweed)
+#  Versión: 1.3
 #
 #  USO:
-#    .\dns_windows.ps1                        (pide dominio interactivamente)
-#    .\dns_windows.ps1 -Domain midominio.com  (dominio como parámetro)
+#    sudo bash dns_linux_opensuse.sh
+#    El dominio se configura en la Opción 3 del menú
 # =============================================================
 
-#Requires -RunAsAdministrator
+# ── Colores ──────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
 
-$DOMAIN = ""
-$DNS_IP = ""
-$ErrorActionPreference = "Continue"
+# ── Variables globales (dominio se configura en opción 3) ─────
+DOMAIN=""
+ZONE_FILE=""
+NAMED_CONF="/etc/named.conf"
+NAMED_CONF_LOCAL=""
+DNS_IP=""
 
 # ── Funciones de log ─────────────────────────────────────────
-function Log-Info  { param($msg) Write-Host "[INFO]  $msg" -ForegroundColor Cyan }
-function Log-Ok    { param($msg) Write-Host "[OK]    $msg" -ForegroundColor Green }
-function Log-Warn  { param($msg) Write-Host "[WARN]  $msg" -ForegroundColor Yellow }
-function Log-Error { param($msg) Write-Host "[ERROR] $msg" -ForegroundColor Red }
+log_info()  { echo -e "${CYAN}[INFO]${NC}  $1"; }
+log_ok()    { echo -e "${GREEN}[OK]${NC}    $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-function Print-Banner {
-    Clear-Host
-    $domDisplay = if ([string]::IsNullOrWhiteSpace($DOMAIN)) { "Sin configurar" } else { $DOMAIN }
-    Write-Host "╔══════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║   Administrador DNS - Windows Server         ║" -ForegroundColor Cyan
-    Write-Host ("║   Dominio: " + $domDisplay.PadRight(34) + "║") -ForegroundColor Cyan
-    Write-Host "╚══════════════════════════════════════════════╝" -ForegroundColor Cyan
-    Write-Host ""
+# ── Verificar root ────────────────────────────────────────────
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "Este script debe ejecutarse como root (sudo su o sudo bash)."
+        exit 1
+    fi
 }
 
-# ── Función auxiliar: configurar IP estática ─────────────────
-function _Set-StaticIP {
-    param($AdapterIndex, $AdapterName)
+# ── Banner ────────────────────────────────────────────────────
+print_banner() {
+    clear
+    local DOM_DISPLAY="${DOMAIN:-Sin configurar}"
+    echo -e "${CYAN}${BOLD}"
+    echo "╔══════════════════════════════════════════════╗"
+    echo "║   Administrador DNS - BIND9 - OpenSUSE       ║"
+    printf "║   Dominio: %-34s║\n" "${DOM_DISPLAY}"
+    echo "╚══════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
 
-    Write-Host ""
-    Log-Info "Configuración de IP estática para: $AdapterName"
-    $newIP   = Read-Host "IP estática (ej: 192.168.1.100)"
-    $prefix  = Read-Host "Longitud de prefijo (ej: 24)"
-    $gateway = Read-Host "Gateway (ej: 192.168.1.1)"
-    $dns1    = Read-Host "DNS primario (ej: 8.8.8.8)"
+# ── Función auxiliar: configurar IP estática (wicked) ────────
+_configurar_ip_estatica() {
+    local IFACE=$1
 
-    if ($newIP -notmatch "^\d{1,3}(\.\d{1,3}){3}$") {
-        Log-Error "Formato de IP inválido: $newIP"; return $null
-    }
+    echo -ne "IP estática (ej: 192.168.1.100): "; read -r NEW_IP
+    echo -ne "Máscara en bits (ej: 24):         "; read -r PREFIX
+    echo -ne "Gateway (ej: 192.168.1.1):        "; read -r GATEWAY
+    echo -ne "DNS primario (ej: 8.8.8.8):       "; read -r DNS1
 
-    try {
-        Remove-NetIPAddress -InterfaceIndex $AdapterIndex -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
-        Remove-NetRoute     -InterfaceIndex $AdapterIndex -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+    if ! [[ "$NEW_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "Formato de IP inválido: $NEW_IP"; return 1
+    fi
 
-        New-NetIPAddress -InterfaceIndex $AdapterIndex -IPAddress $newIP `
-                         -PrefixLength $prefix -DefaultGateway $gateway | Out-Null
-        Set-DnsClientServerAddress -InterfaceIndex $AdapterIndex -ServerAddresses ($dns1, "8.8.8.8")
+    local CFG_FILE="/etc/sysconfig/network/ifcfg-${IFACE}"
+    local ROUTE_FILE="/etc/sysconfig/network/ifroute-${IFACE}"
+    local DNS_FILE="/etc/sysconfig/network/config"
 
-        Log-Ok "IP estática asignada: $newIP/$prefix"
-        return $newIP
-    } catch {
-        Log-Error "Error al configurar IP: $_"; return $null
-    }
+    log_info "Escribiendo configuración en ${CFG_FILE}..."
+
+    cat > "$CFG_FILE" <<EOF
+BOOTPROTO='static'
+STARTMODE='auto'
+IPADDR='${NEW_IP}'
+PREFIXLEN='${PREFIX}'
+EOF
+
+    # Ruta por defecto
+    echo "default ${GATEWAY} - -" > "$ROUTE_FILE"
+
+    # DNS en /etc/sysconfig/network/config
+    if grep -q "^NETCONFIG_DNS_STATIC_SERVERS" "$DNS_FILE" 2>/dev/null; then
+        sed -i "s|^NETCONFIG_DNS_STATIC_SERVERS=.*|NETCONFIG_DNS_STATIC_SERVERS='${DNS1} 8.8.8.8'|" "$DNS_FILE"
+    else
+        echo "NETCONFIG_DNS_STATIC_SERVERS='${DNS1} 8.8.8.8'" >> "$DNS_FILE"
+    fi
+
+    # Aplicar configuración
+    wicked ifdown "$IFACE" &>/dev/null
+    wicked ifup "$IFACE"
+    netconfig update -f &>/dev/null
+
+    if [[ $? -eq 0 ]]; then
+        log_ok "IP estática aplicada: ${NEW_IP}/${PREFIX}"
+        DNS_IP="$NEW_IP"
+    else
+        log_error "Error al aplicar configuración de red."
+        return 1
+    fi
 }
 
 # ── Función auxiliar: resolver IP a usar ─────────────────────
-function _Resolve-IP {
-    if ($script:DNS_IP -ne "") { return }
+_resolver_ip() {
+    if [[ -n "$DNS_IP" ]]; then return; fi
 
-    # Obtener todos los adaptadores activos con IPv4
-    $adapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" }
+    # Listar todas las interfaces activas con IPv4 (excluir loopback)
+    echo ""
+    log_info "Interfaces de red disponibles:"
+    local -a IFACES=()
+    local -a IPS=()
+    local idx=1
 
-    if ($adapters.Count -eq 0) {
-        Log-Error "No se encontraron adaptadores de red activos."
-        return
-    }
+    while IFS= read -r IFACE_LINE; do
+        local iface ip cfg tipo
+        iface=$(echo "$IFACE_LINE" | awk '{print $2}' | tr -d ':@')
+        [[ "$iface" == "lo" ]] && continue
+        ip=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]}' | head -1)
+        [[ -z "$ip" ]] && continue
+        cfg="/etc/sysconfig/network/ifcfg-${iface}"
+        if [[ -f "$cfg" ]] && grep -q "BOOTPROTO=.static." "$cfg" 2>/dev/null; then
+            tipo="Estática"
+        else
+            tipo="DHCP"
+        fi
+        echo -e "  ${BOLD}${idx})${NC} ${iface} | IP: ${ip} | ${tipo}"
+        IFACES+=("$iface")
+        IPS+=("$ip")
+        ((idx++))
+    done < <(ip -o link show up)
 
-    # Mostrar todas las interfaces disponibles para que el usuario elija
-    Write-Host ""
-    Log-Info "Interfaces de red disponibles:"
-    $i = 1
-    $adapterList = @()
-    foreach ($a in $adapters) {
-        $ipCfg = Get-NetIPConfiguration -InterfaceIndex $a.InterfaceIndex -ErrorAction SilentlyContinue
-        $ip = if ($ipCfg.IPv4Address) { $ipCfg.IPv4Address.IPAddress } else { "Sin IP" }
-        $dhcpStatus = (Get-NetIPInterface -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).Dhcp
-        $tipo = if ($dhcpStatus -eq "Disabled") { "Estática" } else { "DHCP" }
-        Write-Host "  $i) $($a.Name) | IP: $ip | $tipo" -ForegroundColor White
-        $adapterList += $a
-        $i++
-    }
+    if [[ ${#IFACES[@]} -eq 0 ]]; then
+        log_error "No se encontraron interfaces de red activas."
+        return 1
+    fi
 
-    Write-Host ""
-    $sel = Read-Host "Selecciona la interfaz de red interna [1-$($adapterList.Count)]"
-    $idx = [int]$sel - 1
+    echo ""
+    echo -ne "Selecciona la interfaz de red interna [1-${#IFACES[@]}]: "; read -r SEL
+    SEL=$(( SEL - 1 ))
 
-    if ($idx -lt 0 -or $idx -ge $adapterList.Count) {
-        Log-Error "Selección inválida. Usando primera interfaz."
-        $idx = 0
-    }
+    if [[ $SEL -lt 0 || $SEL -ge ${#IFACES[@]} ]]; then
+        log_warn "Selección inválida. Usando primera interfaz."
+        SEL=0
+    fi
 
-    $adapter  = $adapterList[$idx]
-    $ipCfg    = Get-NetIPConfiguration -InterfaceIndex $adapter.InterfaceIndex
-    $currentIP = if ($ipCfg.IPv4Address) { $ipCfg.IPv4Address.IPAddress } else { "" }
-    $dhcp     = (Get-NetIPInterface -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4).Dhcp
+    local IFACE="${IFACES[$SEL]}"
+    local DETECTED="${IPS[$SEL]}"
+    local CFG_FILE="/etc/sysconfig/network/ifcfg-${IFACE}"
 
-    if ($dhcp -eq "Disabled") {
-        Log-Ok "IP estática detectada en $($adapter.Name): $currentIP"
-        Write-Host ""
-        $cambiar = Read-Host "¿Deseas modificar la IP, gateway o DNS de esta interfaz? (s/n)"
-        if ($cambiar -match "^[Ss]$") {
-            $result = _Set-StaticIP -AdapterIndex $adapter.InterfaceIndex -AdapterName $adapter.Name
-            if ($result) { $script:DNS_IP = $result }
-            else         { $script:DNS_IP = $currentIP }
-        } else {
-            $script:DNS_IP = $currentIP
-            Log-Ok "Usando IP estática actual: $currentIP"
-        }
-    } else {
-        Log-Warn "IP dinámica (DHCP) en $($adapter.Name): $currentIP"
-        $resp = Read-Host "¿Configurar IP estática ahora? (s/n)"
-        if ($resp -match "^[Ss]$") {
-            $result = _Set-StaticIP -AdapterIndex $adapter.InterfaceIndex -AdapterName $adapter.Name
-            if ($result) { $script:DNS_IP = $result }
-            else         { $script:DNS_IP = $currentIP }
-        } else {
-            $script:DNS_IP = $currentIP
-            Log-Warn "Usando IP dinámica: $currentIP"
-        }
-    }
+    log_info "Interfaz seleccionada: ${IFACE} | IP: ${DETECTED}"
+
+    local IS_STATIC=false
+    if [[ -f "$CFG_FILE" ]] && grep -q "BOOTPROTO=.static." "$CFG_FILE" 2>/dev/null; then
+        IS_STATIC=true
+    fi
+
+    if $IS_STATIC; then
+        log_ok "IP estática confirmada: ${DETECTED}"
+        echo -ne "¿Deseas modificar la IP, gateway o DNS de esta interfaz? (s/n): "; read -r CAMBIAR
+        if [[ "$CAMBIAR" =~ ^[Ss]$ ]]; then
+            _configurar_ip_estatica "$IFACE"
+        else
+            DNS_IP="$DETECTED"
+            log_ok "Usando IP estática actual: ${DNS_IP}"
+        fi
+    else
+        log_warn "IP dinámica detectada en ${IFACE}: ${DETECTED}"
+        echo -ne "¿Configurar IP estática ahora? (s/n): "; read -r REPLY
+        if [[ "$REPLY" =~ ^[Ss]$ ]]; then
+            _configurar_ip_estatica "$IFACE"
+        else
+            DNS_IP="$DETECTED"
+            log_warn "Usando IP actual: ${DNS_IP}"
+        fi
+    fi
 }
 
+# ── Función auxiliar: asegurar include en named.conf ─────────
+_asegurar_include_named() {
+    # OpenSUSE incluye archivos desde /etc/named.d/ — asegurar que esté declarado
+    if ! grep -q "named.d" "$NAMED_CONF" 2>/dev/null; then
+        echo "" >> "$NAMED_CONF"
+        echo "include \"/etc/named.d/${DOMAIN}.conf\";" >> "$NAMED_CONF"
+        log_ok "Include agregado en $NAMED_CONF"
+    elif ! grep -q "${DOMAIN}.conf" "$NAMED_CONF" 2>/dev/null; then
+        echo "include \"/etc/named.d/${DOMAIN}.conf\";" >> "$NAMED_CONF"
+        log_ok "Include de zona agregado en $NAMED_CONF"
+    else
+        log_info "Include de zona ya presente en named.conf."
+    fi
+}
 
 # ── Función auxiliar: pedir y validar dominio ────────────────
-function _Resolver-Dominio {
-    if (-not [string]::IsNullOrWhiteSpace($script:DOMAIN)) { return $true }
+_resolver_dominio() {
+    if [[ -n "$DOMAIN" ]]; then return 0; fi
 
-    Write-Host ""
-    $d = Read-Host "Ingresa el dominio a configurar (ej: reprobados.com)"
-    if ([string]::IsNullOrWhiteSpace($d)) {
-        $d = "reprobados.com"
-        Log-Warn "No se ingresó dominio. Usando valor por defecto: $d"
-    }
+    echo -ne "\nIngresa el dominio a configurar (ej: reprobados.com): "
+    read -r DOMAIN
+    if [[ -z "$DOMAIN" ]]; then
+        DOMAIN="reprobados.com"
+        log_warn "No se ingresó dominio. Usando valor por defecto: ${DOMAIN}"
+    fi
 
-    if ($d -notmatch "^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$") {
-        Log-Error "Formato de dominio inválido: $d"
-        return $false
-    }
+    if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$ ]]; then
+        log_error "Formato de dominio inválido: ${DOMAIN}"
+        DOMAIN=""
+        return 1
+    fi
 
-    $script:DOMAIN = $d
-    Log-Ok "Dominio configurado: $($script:DOMAIN)"
-    return $true
+    ZONE_FILE="/var/lib/named/${DOMAIN}.zone"
+    NAMED_CONF_LOCAL="/etc/named.d/${DOMAIN}.conf"
+    log_ok "Dominio configurado: ${DOMAIN}"
+    return 0
 }
 
 # ════════════════════════════════════════════════════════════
 #  OPCIÓN 1 — Instalación Idempotente
 # ════════════════════════════════════════════════════════════
-function Opcion-Instalacion {
-    Write-Host "`n── [ 1 ] Instalación Idempotente ──────────────────" -ForegroundColor White
+opcion_instalacion() {
+    echo -e "\n${BOLD}── [ 1 ] Instalación Idempotente ──────────────────${NC}"
 
-    _Resolve-IP
+    _resolver_ip
 
-    Log-Info "Verificando si el rol DNS ya está instalado..."
+    log_info "Verificando si BIND ya está instalado..."
 
-    $feature = Get-WindowsFeature -Name DNS
-
-    if ($feature.Installed) {
-        Log-Ok "Rol DNS ya instalado. No se reinstalará (idempotente)."
-
-        $svc = Get-Service -Name "DNS" -ErrorAction SilentlyContinue
-
-        if (-not $svc) {
-            Log-Error "El servicio DNS no fue encontrado en el sistema."
-            return
-        }
-
-        if ($svc.Status -eq "Running") {
-            Log-Ok "Servicio DNS ya en ejecución."
-            return
-        }
-
-        Log-Info "Configurando inicio automático del servicio DNS..."
-        Set-Service DNS -StartupType Automatic
-
-        Log-Info "Intentando iniciar el servicio DNS..."
-        try {
-            Start-Service DNS -ErrorAction Stop
-            Start-Sleep -Seconds 3
-
-            $svcCheck = Get-Service -Name "DNS"
-            if ($svcCheck.Status -eq "Running") {
-                Log-Ok "Servicio DNS iniciado correctamente."
-            } else {
-                Log-Error "El servicio no quedó en estado Running. Estado actual: $($svcCheck.Status)"
-                Log-Warn "Revisa el Visor de Eventos: eventvwr.msc -> Registros de Windows -> Sistema"
-            }
-        } catch {
-            Log-Error "No se pudo iniciar el servicio DNS: $_"
-            Log-Warn "Posibles causas:"
-            Log-Warn "  1) El rol DNS requiere reiniciar el servidor tras la instalación."
-            Log-Warn "  2) Conflicto con otro servicio en el puerto 53."
-            Log-Warn "Verifica con: Get-EventLog -LogName System -Source DNS -Newest 5"
-        }
+    # En OpenSUSE el paquete es 'bind' y el servicio es 'named'
+    if systemctl is-active --quiet named; then
+        log_ok "BIND (named) ya está en ejecución. No se reinstalará (idempotente)."
         return
-    }
+    fi
 
-    Log-Info "Instalando rol DNS Server con herramientas de administración..."
-    try {
-        Install-WindowsFeature DNS -IncludeManagementTools | Out-Null
-        Set-Service DNS -StartupType Automatic
-        Start-Service DNS
-        Log-Ok "Rol DNS instalado e iniciado correctamente."
-    } catch {
-        Log-Error "Error al instalar el rol DNS: $_"
-    }
+    if rpm -q bind &>/dev/null; then
+        log_warn "BIND instalado pero detenido. Iniciando servicio..."
+        systemctl start named
+        systemctl enable named &>/dev/null
+        log_ok "Servicio named iniciado."
+        return
+    fi
+
+    log_info "Instalando bind y bind-utils con zypper..."
+    zypper --non-interactive install bind bind-utils
+
+    if [[ $? -ne 0 ]]; then
+        log_error "Error durante la instalación de BIND."
+        return
+    fi
+
+    # Crear directorio para zonas si no existe
+    mkdir -p /var/lib/named
+    mkdir -p /etc/named.d
+
+    # Asignar permisos correctos
+    chown named:named /var/lib/named
+    chmod 750 /var/lib/named
+
+    systemctl enable named &>/dev/null
+    systemctl start named
+    log_ok "BIND instalado e iniciado correctamente."
 }
 
 # ════════════════════════════════════════════════════════════
 #  OPCIÓN 2 — Configuración de Zona DNS
 # ════════════════════════════════════════════════════════════
-function Opcion-Zona {
-    Write-Host "`n── [ 2 ] Configuración de Zona DNS ────────────────" -ForegroundColor White
-    if (-not (_Resolver-Dominio)) { return }
+opcion_zona() {
+    echo -e "\n${BOLD}── [ 2 ] Configuración de Zona DNS ────────────────${NC}"
 
-
-    # ── Verificar que el servicio DNS esté activo ─────────
-    Log-Info "Verificando que el servicio DNS esté activo..."
-    $svc = Get-Service -Name "DNS" -ErrorAction SilentlyContinue
-
-    if (-not $svc) {
-        Log-Error "Servicio DNS no encontrado. Ejecuta primero la Opción 1 (Instalación)."
+    # Verificar que BIND esté instalado antes de continuar
+    if ! rpm -q bind &>/dev/null; then
+        log_error "BIND no está instalado. Ejecuta primero la Opción 1 (Instalación)."
         return
-    }
+    fi
 
-    if ($svc.Status -ne "Running") {
-        # Verificar si el servicio está deshabilitado y reactivarlo
-        $startType = (Get-Service DNS).StartType
-        if ($startType -eq "Disabled") {
-            Log-Warn "Servicio DNS deshabilitado. Reactivando..."
-            Set-Service DNS -StartupType Automatic
-            Log-Ok "Tipo de inicio restaurado a Automático."
-        }
+    # Verificar que named-checkconf esté disponible
+    if ! command -v named-checkconf &>/dev/null; then
+        log_warn "named-checkconf no encontrado. Instalando bind-utils..."
+        zypper --non-interactive install bind-utils &>/dev/null
+    fi
 
-        Log-Warn "Servicio DNS detenido. Iniciando..."
-        try {
-            Start-Service DNS -ErrorAction Stop
-            Start-Sleep -Seconds 3
+    _resolver_dominio || return
+    _resolver_ip
 
-            $check = Get-Service -Name "DNS"
-            if ($check.Status -eq "Running") {
-                Log-Ok "Servicio DNS iniciado correctamente."
-            } else {
-                Log-Error "El servicio no quedó en estado Running. Estado: $($check.Status)"
-                Log-Warn "Intenta reiniciar el servidor con: Restart-Computer"
-                return
-            }
-        } catch {
-            Log-Error "No se pudo iniciar el servicio DNS: $_"
-            Log-Warn "Intenta reiniciar el servidor con: Restart-Computer"
-            return
-        }
-    } else {
-        Log-Ok "Servicio DNS en ejecución."
-    }
+    # Asegurar que existe el directorio para configuraciones de zona
+    mkdir -p /etc/named.d
 
-    _Resolve-IP
+    log_info "Configurando zona en: ${NAMED_CONF_LOCAL}..."
 
-    Log-Info "Verificando si la zona $DOMAIN ya existe..."
+    # Reescribir el archivo de zona con idempotencia
+    cat > "$NAMED_CONF_LOCAL" <<EOF
+// Zona directa ${DOMAIN} — generada automáticamente por script
+zone "${DOMAIN}" IN {
+    type master;
+    file "${ZONE_FILE}";
+    allow-query { any; };
+    allow-update { none; };
+};
+EOF
 
-    $zona = Get-DnsServerZone -Name $DOMAIN -ErrorAction SilentlyContinue
-    if ($zona) {
-        Log-Warn "Zona $DOMAIN ya existe. Se eliminará y recreará."
-        Remove-DnsServerZone -Name $DOMAIN -Force -Confirm:$false
-        Log-Ok "Zona anterior eliminada."
-    }
+    log_ok "Archivo de zona declarado: ${NAMED_CONF_LOCAL}"
 
-    try {
-        Log-Info "Creando zona primaria: $DOMAIN..."
-        Add-DnsServerPrimaryZone -Name $DOMAIN -ZoneFile "${DOMAIN}.dns" -DynamicUpdate None
-        Start-Sleep -Seconds 2
-        Log-Ok "Zona primaria '$DOMAIN' creada correctamente."
-    } catch {
-        Log-Error "Error al crear zona: $_"
-        Log-Warn "Asegúrate de haber ejecutado la Opción 1 (Instalación) primero."
-    }
+    # Asegurar que named.conf incluye este archivo
+    _asegurar_include_named
+
+    # Generar archivo de zona base (SOA + NS)
+    log_info "Generando archivo de zona base: ${ZONE_FILE}..."
+    local SERIAL
+    SERIAL=$(date +%Y%m%d01)
+
+    mkdir -p /var/lib/named
+
+    cat > "$ZONE_FILE" <<EOF
+\$TTL    86400
+@       IN      SOA     ns1.${DOMAIN}. admin.${DOMAIN}. (
+                         ${SERIAL}  ; Serial
+                         3600       ; Refresh
+                         900        ; Retry
+                         604800     ; Expire
+                         86400 )    ; Negative Cache TTL
+
+; Servidor de nombres
+@       IN      NS      ns1.${DOMAIN}.
+ns1     IN      A       ${DNS_IP}
+EOF
+
+    chown named:named "$ZONE_FILE" 2>/dev/null
+    chmod 640 "$ZONE_FILE"
+    log_ok "Archivo de zona base creado: ${ZONE_FILE}"
+
+    # Validar sintaxis
+    log_info "Validando con named-checkconf..."
+    named-checkconf "$NAMED_CONF" && log_ok "named-checkconf: OK" || { log_error "Error en named.conf"; return; }
+
+    log_info "Validando con named-checkzone..."
+    named-checkzone "$DOMAIN" "$ZONE_FILE" && log_ok "named-checkzone: OK" || { log_error "Error en archivo de zona."; return; }
+
+    systemctl restart named && log_ok "Servicio named reiniciado." || log_error "Error al reiniciar named."
+}
+
+# ── Función auxiliar: solicitar/validar dominio ──────────────
+_configurar_dominio() {
+    if [[ -n "$DOMAIN" ]]; then
+        log_info "Dominio activo: ${DOMAIN}"
+        echo -ne "¿Deseas usar otro dominio? (s/n): "; read -r CAMBIAR
+        if [[ ! "$CAMBIAR" =~ ^[Ss]$ ]]; then return; fi
+    fi
+
+    echo -ne "Ingresa el dominio a configurar (ej: reprobados.com): "; read -r INPUT_DOMAIN
+    if [[ -z "$INPUT_DOMAIN" ]]; then
+        INPUT_DOMAIN="reprobados.com"
+        log_warn "No se ingresó dominio. Usando valor por defecto: ${INPUT_DOMAIN}"
+    fi
+
+    if ! [[ "$INPUT_DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$ ]]; then
+        log_error "Formato de dominio inválido: ${INPUT_DOMAIN}"; return 1
+    fi
+
+    DOMAIN="$INPUT_DOMAIN"
+    ZONE_FILE="/var/lib/named/${DOMAIN}.zone"
+    NAMED_CONF_LOCAL="/etc/named.d/${DOMAIN}.conf"
+    log_ok "Dominio configurado: ${DOMAIN}"
 }
 
 # ════════════════════════════════════════════════════════════
 #  OPCIÓN 3 — Configuración de Dominio DNS (Registros)
 # ════════════════════════════════════════════════════════════
-function Opcion-Dominio {
-    Write-Host "`n── [ 3 ] Configuración de Dominio DNS ─────────────" -ForegroundColor White
+opcion_dominio() {
+    echo -e "\n${BOLD}── [ 3 ] Configuración de Dominio DNS ─────────────${NC}"
 
-    # ── Solicitar dominio si no está configurado ──────────
-    if ([string]::IsNullOrWhiteSpace($script:DOMAIN)) {
-        $input = Read-Host "Ingresa el dominio a configurar (ej: reprobados.com)"
-        if ([string]::IsNullOrWhiteSpace($input)) {
-            $input = "reprobados.com"
-            Log-Warn "No se ingresó dominio. Usando valor por defecto: $input"
-        }
-        if ($input -notmatch "^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$") {
-            Log-Error "Formato de dominio inválido: $input"
-            return
-        }
-        $script:DOMAIN = $input
-        Log-Ok "Dominio configurado: $($script:DOMAIN)"
-    } else {
-        Log-Info "Dominio activo: $($script:DOMAIN)"
-        $cambiar = Read-Host "¿Deseas usar otro dominio? (s/n)"
-        if ($cambiar -match "^[Ss]$") {
-            $input = Read-Host "Nuevo dominio"
-            if ($input -notmatch "^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$") {
-                Log-Error "Formato de dominio inválido: $input"
-                return
-            }
-            $script:DOMAIN = $input
-            Log-Ok "Dominio actualizado: $($script:DOMAIN)"
-        }
-    }
+    _configurar_dominio || return
 
-    $zona = Get-DnsServerZone -Name $DOMAIN -ErrorAction SilentlyContinue
-    if (-not $zona) {
-        Log-Error "Zona $DOMAIN no encontrada."
-        Log-Warn "Ejecuta primero la Opción 2 (Configuración de Zona DNS)."
+    if [[ ! -f "$ZONE_FILE" ]]; then
+        log_error "Archivo de zona no encontrado: ${ZONE_FILE}"
+        log_warn "Ejecuta primero la Opción 2 (Configuración de Zona DNS)."
         return
-    }
+    fi
 
-    _Resolve-IP
+    _resolver_ip
 
-    # ── Registro A para dominio raíz (@) ─────────────────
-    $existeA = Get-DnsServerResourceRecord -ZoneName $DOMAIN -Name "@" -RRType A -ErrorAction SilentlyContinue
-    if ($existeA) {
-        Log-Warn "Registro A raíz ya existe. Eliminando para recrear..."
-        Remove-DnsServerResourceRecord -ZoneName $DOMAIN -Name "@" -RRType A -Force -Confirm:$false -ErrorAction SilentlyContinue
-    }
-    try {
-        Add-DnsServerResourceRecordA -ZoneName $DOMAIN -Name "@" -IPv4Address $script:DNS_IP -TimeToLive (New-TimeSpan -Hours 1)
-        Log-Ok "Registro A: $DOMAIN → $($script:DNS_IP)"
-    } catch {
-        Log-Error "Error al crear registro A raíz: $_"
-    }
+    log_info "Agregando registros DNS para ${DOMAIN}..."
 
-    # ── Registro A para www ───────────────────────────────
-    $existeWWW = Get-DnsServerResourceRecord -ZoneName $DOMAIN -Name "www" -RRType A -ErrorAction SilentlyContinue
-    if ($existeWWW) {
-        Log-Warn "Registro A www ya existe. Eliminando para recrear..."
-        Remove-DnsServerResourceRecord -ZoneName $DOMAIN -Name "www" -RRType A -Force -Confirm:$false -ErrorAction SilentlyContinue
-    }
-    try {
-        Add-DnsServerResourceRecordA -ZoneName $DOMAIN -Name "www" -IPv4Address $script:DNS_IP -TimeToLive (New-TimeSpan -Hours 1)
-        Log-Ok "Registro A: www.$DOMAIN → $($script:DNS_IP)"
-    } catch {
-        Log-Error "Error al crear registro A www: $_"
-    }
+    # Eliminar registros previos de @ y www para evitar duplicados
+    sed -i "/^@[[:space:]]*IN[[:space:]]*A/d" "$ZONE_FILE"
+    sed -i "/^www[[:space:]]*IN[[:space:]]*A/d" "$ZONE_FILE"
+    sed -i "/^www[[:space:]]*IN[[:space:]]*CNAME/d" "$ZONE_FILE"
 
-    # ── Mostrar registros actuales ────────────────────────
-    Write-Host ""
-    Log-Info "Registros actuales en la zona $DOMAIN :"
-    Get-DnsServerResourceRecord -ZoneName $DOMAIN | Format-Table -AutoSize
+    # Agregar registro A para dominio raíz
+    echo "@       IN      A       ${DNS_IP}" >> "$ZONE_FILE"
+    log_ok "Registro A: ${DOMAIN} → ${DNS_IP}"
+
+    # Agregar registro CNAME para www → dominio raíz
+    echo "www     IN      CNAME   ${DOMAIN}." >> "$ZONE_FILE"
+    log_ok "Registro CNAME: www.${DOMAIN} → ${DOMAIN}"
+
+    # Actualizar Serial
+    local SERIAL
+    SERIAL=$(date +%Y%m%d01)
+    sed -i "s/[0-9]\{10\}[[:space:]]*; Serial/${SERIAL}  ; Serial/" "$ZONE_FILE"
+    log_ok "Serial actualizado: ${SERIAL}"
+
+    echo ""
+    echo -e "${CYAN}Contenido final del archivo de zona:${NC}"
+    echo "─────────────────────────────────────────────"
+    cat "$ZONE_FILE"
+    echo "─────────────────────────────────────────────"
+    echo ""
+
+    log_info "Revalidando zona..."
+    named-checkzone "$DOMAIN" "$ZONE_FILE" && log_ok "Zona válida." || { log_error "Error en zona."; return; }
+
+    systemctl restart named && log_ok "Servicio named reiniciado con nuevos registros." || log_error "Error al reiniciar named."
 }
 
 # ════════════════════════════════════════════════════════════
 #  OPCIÓN 4 — Dar de Baja DNS
 # ════════════════════════════════════════════════════════════
-function Opcion-Baja {
-    Write-Host "`n── [ 4 ] Dar de Baja DNS ──────────────────────────" -ForegroundColor White
+opcion_baja() {
+    echo -e "\n${BOLD}── [ 4 ] Dar de Baja DNS ──────────────────────────${NC}"
 
-    if (-not (_Resolver-Dominio)) { return }
+    echo -ne "${YELLOW}¿Confirmas dar de baja el DNS para ${DOMAIN}? (s/n): ${NC}"
+    read -r CONF
+    if [[ ! "$CONF" =~ ^[Ss]$ ]]; then
+        log_warn "Operación cancelada."; return
+    fi
 
-    $conf = Read-Host "¿Confirmas dar de baja el DNS para $DOMAIN? (s/n)"
-    if ($conf -notmatch "^[Ss]$") {
-        Log-Warn "Operación cancelada."; return
-    }
+    # Detener y deshabilitar servicio named
+    log_info "Deteniendo servicio named..."
+    systemctl stop named    && log_ok "Servicio named detenido."    || log_warn "Servicio ya detenido."
+    systemctl disable named &>/dev/null && log_ok "named deshabilitado del arranque."
 
-    # Eliminar zona
-    $zona = Get-DnsServerZone -Name $DOMAIN -ErrorAction SilentlyContinue
-    if ($zona) {
-        Remove-DnsServerZone -Name $DOMAIN -Force -Confirm:$false
-        Log-Ok "Zona $DOMAIN eliminada."
-    } else {
-        Log-Warn "Zona $DOMAIN no encontrada (ya eliminada)."
-    }
+    # Eliminar archivo de configuración de zona
+    if [[ -f "$NAMED_CONF_LOCAL" ]]; then
+        rm -f "$NAMED_CONF_LOCAL"
+        log_ok "Configuración de zona eliminada: ${NAMED_CONF_LOCAL}"
+    else
+        log_warn "Archivo ${NAMED_CONF_LOCAL} no encontrado."
+    fi
 
-    # Detener servicio DNS
-    $svc = Get-Service -Name "DNS" -ErrorAction SilentlyContinue
-    if ($svc -and $svc.Status -eq "Running") {
-        Stop-Service DNS -Force
-        Set-Service DNS -StartupType Disabled
-        Log-Ok "Servicio DNS detenido y deshabilitado."
-    } else {
-        Log-Warn "El servicio DNS ya estaba detenido."
-    }
+    # Eliminar include de named.conf si existe
+    if grep -q "${DOMAIN}.conf" "$NAMED_CONF" 2>/dev/null; then
+        sed -i "/${DOMAIN}.conf/d" "$NAMED_CONF"
+        log_ok "Include de zona eliminado de named.conf."
+    fi
 
-    $script:DNS_IP = ""
-    Log-Ok "DNS dado de baja correctamente."
+    # Eliminar archivo de zona
+    if [[ -f "$ZONE_FILE" ]]; then
+        rm -f "$ZONE_FILE"
+        log_ok "Archivo de zona eliminado: ${ZONE_FILE}"
+    else
+        log_warn "Archivo de zona no encontrado (ya eliminado)."
+    fi
 
-    Write-Host ""
-    $uninstall = Read-Host "¿Desinstalar el rol DNS de Windows Server? (s/n)"
-    if ($uninstall -match "^[Ss]$") {
-        try {
-            Remove-WindowsFeature DNS -IncludeManagementTools | Out-Null
-            Log-Ok "Rol DNS desinstalado del sistema."
-        } catch {
-            Log-Error "Error al desinstalar el rol: $_"
-        }
-    }
+    DNS_IP=""
+    log_ok "DNS dado de baja correctamente."
+
+    echo ""
+    echo -ne "¿Desinstalar BIND completamente del sistema? (s/n): "; read -r UNINSTALL
+    if [[ "$UNINSTALL" =~ ^[Ss]$ ]]; then
+        zypper --non-interactive remove bind bind-utils
+        log_ok "BIND desinstalado del sistema."
+    fi
 }
 
 # ════════════════════════════════════════════════════════════
 #  OPCIÓN 5 — Consultar DNS
 # ════════════════════════════════════════════════════════════
-function Opcion-Consultar {
-    Write-Host "`n── [ 5 ] Consultar DNS ────────────────────────────" -ForegroundColor White
+opcion_consultar() {
+    echo -e "\n${BOLD}── [ 5 ] Consultar DNS ────────────────────────────${NC}"
 
-    # Estado del servicio
-    if (-not (_Resolver-Dominio)) { return }
-    _Resolve-IP
+    # Verificar que bind-utils esté instalado (provee nslookup y dig)
+    if ! command -v nslookup &>/dev/null; then
+        log_warn "nslookup no encontrado. Instalando bind-utils..."
+        zypper --non-interactive install bind-utils &>/dev/null
+    fi
 
-    Write-Host ""
-    Log-Info "Estado del servicio DNS:"
-    $svc = Get-Service -Name "DNS" -ErrorAction SilentlyContinue
-    if ($svc) {
-        Write-Host "  Nombre  : $($svc.Name)" -ForegroundColor Gray
-        Write-Host "  Estado  : $($svc.Status)" -ForegroundColor $(if ($svc.Status -eq "Running") {"Green"} else {"Red"})
-        Write-Host "  Inicio  : $($svc.StartType)" -ForegroundColor Gray
-    } else {
-        Log-Warn "Servicio DNS no encontrado."
-    }
+    echo ""
+    log_info "Estado del servicio named:"
+    systemctl status named --no-pager | head -12
+    echo ""
 
-    $srvDNS = Read-Host "`nServidor DNS a consultar (Enter para 127.0.0.1)"
-    if ([string]::IsNullOrWhiteSpace($srvDNS)) { $srvDNS = "127.0.0.1" }
+    echo -ne "Servidor DNS a consultar (Enter para 127.0.0.1): "; read -r SRV_DNS
+    SRV_DNS="${SRV_DNS:-127.0.0.1}"
 
-    Write-Host ""
-    Write-Host "─── Resolución: $DOMAIN ──────────────────────────────" -ForegroundColor Cyan
-    nslookup $DOMAIN $srvDNS
+    echo ""
+    echo -e "${CYAN}─── nslookup ${DOMAIN} ${SRV_DNS} ────────────────────${NC}"
+    nslookup "${DOMAIN}" "${SRV_DNS}"
 
-    Write-Host ""
-    Write-Host "─── Resolución: www.$DOMAIN ──────────────────────────" -ForegroundColor Cyan
-    nslookup "www.$DOMAIN" $srvDNS
+    echo ""
+    echo -e "${CYAN}─── nslookup www.${DOMAIN} ${SRV_DNS} ───────────────${NC}"
+    nslookup "www.${DOMAIN}" "${SRV_DNS}"
 
-    Write-Host ""
-    Write-Host "─── Ping: www.$DOMAIN ────────────────────────────────" -ForegroundColor Cyan
-    ping -n 2 "www.$DOMAIN"
+    echo ""
+    echo -e "${CYAN}─── dig ${DOMAIN} @${SRV_DNS} ───────────────────────${NC}"
+    dig "${DOMAIN}" @"${SRV_DNS}" +short
 
-    Write-Host ""
-    Log-Info "Registros activos en zona $DOMAIN :"
-    $zona = Get-DnsServerZone -Name $DOMAIN -ErrorAction SilentlyContinue
-    if ($zona) {
-        Get-DnsServerResourceRecord -ZoneName $DOMAIN | Format-Table -AutoSize
-    } else {
-        Log-Warn "Zona $DOMAIN no encontrada o DNS no activo."
-    }
+    echo ""
+    echo -e "${CYAN}─── ping -c 2 www.${DOMAIN} ────────────────────────${NC}"
+    ping -c 2 "www.${DOMAIN}" 2>&1 || log_warn "Ping bloqueado o dominio sin resolución."
+
+    echo ""
+    echo -e "${CYAN}─── Registros activos en zona: ${DOMAIN} ────────────${NC}"
+    if [[ -f "$ZONE_FILE" ]]; then
+        cat "$ZONE_FILE"
+    else
+        log_warn "Archivo de zona no encontrado: ${ZONE_FILE}"
+    fi
 }
 
 # ════════════════════════════════════════════════════════════
 #  MENÚ PRINCIPAL
 # ════════════════════════════════════════════════════════════
-function Menu-Principal {
-    while ($true) {
-        Print-Banner
-        Write-Host "  1) Instalación Idempotente"      -ForegroundColor White
-        Write-Host "  2) Configuración de Zona DNS"     -ForegroundColor White
-        Write-Host "  3) Configuración de Dominio DNS"  -ForegroundColor White
-        Write-Host "  4) Dar de Baja DNS"               -ForegroundColor White
-        Write-Host "  5) Consultar DNS"                 -ForegroundColor White
-        Write-Host "  0) Salir"                         -ForegroundColor White
-        Write-Host ""
+menu_principal() {
+    while true; do
+        print_banner
+        echo -e "  ${BOLD}1)${NC} Instalación Idempotente"
+        echo -e "  ${BOLD}2)${NC} Configuración de Zona DNS"
+        echo -e "  ${BOLD}3)${NC} Configuración de Dominio DNS"
+        echo -e "  ${BOLD}4)${NC} Dar de Baja DNS"
+        echo -e "  ${BOLD}5)${NC} Consultar DNS"
+        echo -e "  ${BOLD}0)${NC} Salir"
+        echo ""
+        echo -ne "Selecciona una opción [0-5]: "; read -r OPT
 
-        $opt = Read-Host "Selecciona una opción [0-5]"
+        case $OPT in
+            1) opcion_instalacion ;;
+            2) opcion_zona        ;;
+            3) opcion_dominio     ;;
+            4) opcion_baja        ;;
+            5) opcion_consultar   ;;
+            0) echo -e "\n${GREEN}Saliendo...${NC}\n"; exit 0 ;;
+            *) log_warn "Opción inválida. Intenta de nuevo." ;;
+        esac
 
-        switch ($opt) {
-            "1" { Opcion-Instalacion }
-            "2" { Opcion-Zona        }
-            "3" { Opcion-Dominio     }
-            "4" { Opcion-Baja        }
-            "5" { Opcion-Consultar   }
-            "0" { Write-Host "`nSaliendo...`n" -ForegroundColor Green; exit 0 }
-            default { Log-Warn "Opción inválida. Intenta de nuevo." }
-        }
-
-        Write-Host ""
-        Read-Host "Presiona Enter para volver al menú"
-    }
+        echo ""
+        echo -ne "Presiona Enter para volver al menú..."; read -r
+    done
 }
 
 # ── Punto de entrada ──────────────────────────────────────────
-Menu-Principal
-'@
+check_root
+menu_principal
